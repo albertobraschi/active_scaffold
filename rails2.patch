@@ -1,0 +1,223 @@
+Subject: [PATCH] combine patches from http://code.google.com/p/activescaffold/issues/detail?id=515 and http://pastie.caboo.se/189094, never got the patchfile from http://pastie.caboo.se/189238 to work, and haven't seen that it is necessary yet
+
+---
+ lib/extensions/action_controller_rendering.rb |   28 ++++++---
+ lib/extensions/action_view_rendering.rb       |   15 ++++-
+ lib/extensions/generic_view_paths.rb          |   85 ++++++++++++++++++-------
+ lib/helpers/form_column_helpers.rb            |   13 +++-
+ 4 files changed, 105 insertions(+), 36 deletions(-)
+
+diff --git a/lib/extensions/action_controller_rendering.rb b/lib/extensions/action_controller_rendering.rb
+index 4f78423..17d4d80 100644
+--- a/lib/extensions/action_controller_rendering.rb
++++ b/lib/extensions/action_controller_rendering.rb
+@@ -2,12 +2,18 @@
+ module ActionController #:nodoc:
+   class Base
+     def render_with_active_scaffold(*args, &block)
+-      if self.class.uses_active_scaffold? and params[:adapter] and @rendering_adapter.nil?
++      # ACC I'm never seeing this params[:adapter] value being passed in, only args[0][:action]
++      if self.class.uses_active_scaffold? and ( params[:adapter] || args[0][:action] ) and @rendering_adapter.nil?
+         @rendering_adapter = true # recursion control
+         # if we need an adapter, then we render the actual stuff to a string and insert it into the adapter template
+-        render :file => rewrite_template_path_for_active_scaffold(params[:adapter]),
++        path_val = params[:adapter] || args[0][:action]
++        # ACC I'm setting use_full_path to false here and rewrite_template_path_for_active_scaffold has been
++        # modified to return an absolute path
++        show_layout = args[0][:partial] ? false : true
++        render :file => rewrite_template_path_for_active_scaffold(path_val),
+                :locals => {:payload => render_to_string(args.first, &block)},
+-               :use_full_path => true
++               :use_full_path => false,
++               :layout => show_layout
+         @rendering_adapter = nil # recursion control
+       else
+         render_without_active_scaffold(*args, &block)
+@@ -33,14 +39,20 @@ module ActionController #:nodoc:
+     private
+ 
+     def rewrite_template_path_for_active_scaffold(path)
+-      # test for the actual file
+-      return path if template_exists? default_template_name(path)
++      base = File.join RAILS_ROOT, 'app', 'views'
+       # check the ActiveScaffold-specific directories
+       active_scaffold_config.template_search_path.each do |template_path|
+-        full_path = File.join(template_path, path)
+-        return full_path if template_exists? full_path
++        search_dir = File.join base, template_path
++        next unless File.exists?(search_dir)
++        # ACC I'm using this regex directory search because I don't know how to hook into the
++        # rails code that would do this for me. I am assuming here that path is a non-nested
++        # partial, so my regex is fragile, and will only work in that case. 
++        template_file = Dir.entries(search_dir).find {|f| f =~ /^#{path}/ }
++        # ACC pick_template and template_exists? are the same method (aliased), using both versions
++        # to express intent.
++        return File.join(search_dir, template_file) if template_exists?(template_file)
+       end
+       return path
+     end
+   end
+-end
++end
+\ No newline at end of file
+diff --git a/lib/extensions/action_view_rendering.rb b/lib/extensions/action_view_rendering.rb
+index 1d625ad..edccb5a 100644
+--- a/lib/extensions/action_view_rendering.rb
++++ b/lib/extensions/action_view_rendering.rb
+@@ -74,15 +74,24 @@ module ActionView #:nodoc:
+ 
+     private
+ 
++    # FIXME hack, this has been removed in edge rails
++    def active_scaffold_partial_pieces(partial_path) 
++      if partial_path.include?('/') 
++        return File.dirname(partial_path), File.basename(partial_path) 
++      else 
++        return controller.class.controller_path, partial_path 
++      end 
++    end
++            
+     def rewrite_partial_path_for_active_scaffold(partial_path)
+-      path, partial_name = partial_pieces(partial_path)
++      path, partial_name = active_scaffold_partial_pieces(partial_path)
+ 
+       # test for the actual file
+-      return partial_path if file_exists? File.join(path, "_#{partial_name}")
++      return partial_path if File.exists? File.join(path, "_#{partial_name}")
+ 
+       # check the ActiveScaffold-specific directories
+       active_scaffold_config.template_search_path.each do |template_path|
+-        return File.join(template_path, partial_name) if file_exists? File.join(template_path, "_#{partial_name}")
++        return File.join(template_path, partial_name) if File.exists? File.join(template_path, "_#{partial_name}")
+       end
+       return partial_path
+     end
+diff --git a/lib/extensions/generic_view_paths.rb b/lib/extensions/generic_view_paths.rb
+index 1543e1f..74d505f 100644
+--- a/lib/extensions/generic_view_paths.rb
++++ b/lib/extensions/generic_view_paths.rb
+@@ -16,32 +16,71 @@ class ActionController::Base
+   self.generic_view_paths = []
+ end
+ 
+-class ActionView::Base
+-  private
+-  def find_full_template_path_with_generic_paths(template_path, extension)
+-    path = find_full_template_path_without_generic_paths(template_path, extension)
+-    if path and not path.empty?
+-      path
+-    elsif search_generic_view_paths?
+-      template_file = File.basename("#{template_path}.#{extension}")
+-      path = find_generic_base_path_for(template_file)
+-      path ? "#{path}/#{template_file}" : ""
+-    else
+-      ""
++# find_full_template_path is no longer around in edge rails. Replaced with the TemplateFinder class (leading
++# to much headache)
++if ActionView::Base.method_defined? :find_full_template_path
++  class ActionView::Base
++    private
++    def find_full_template_path_with_generic_paths(template_path, extension)
++      path = find_full_template_path_without_generic_paths(template_path, extension)
++      if path and not path.empty?
++        path
++      elsif search_generic_view_paths?
++        template_file = File.basename("#{template_path}.#{extension}")
++        path = find_generic_base_path_for(template_file)
++        path ? "#{path}/#{template_file}" : ""
++      else
++        ""
++      end
++    end
++    alias_method_chain :find_full_template_path, :generic_paths
++
++    # Returns the view path that contains the given relative template path.
++    def find_generic_base_path_for(template_file_name)
++      controller.generic_view_paths.find { |p| File.file?(File.join(p, template_file_name)) }
+     end
+-  end
+-  alias_method_chain :find_full_template_path, :generic_paths
+ 
+-  # Returns the view path that contains the given relative template path.
+-  def find_generic_base_path_for(template_file_name)
+-    controller.generic_view_paths.find { |p| File.file?(File.join(p, template_file_name)) }
++    # We don't want to use generic_view_paths in ActionMailer, and we don't want
++    # to use them unless the controller action was explicitly defined.
++    def search_generic_view_paths?
++      controller.respond_to?(:generic_view_paths) and controller.class.action_methods.include?(controller.action_name)
++    end
+   end
++else
++  # This hooks into edge rails as of revision 8804 (desparately need the new polymorphic eagerloading from edge)
++  class ActionView::TemplateFinder
++    def pick_template_with_generic_paths(template_path, extension)
++      path = pick_template_without_generic_paths(template_path, extension)
++      if path && !path.empty?
++        path
++      else
++        template_file = File.basename(template_path)
++        template_path = find_generic_base_path_for(template_file, extension)
++        # ACC return absolute path to file
++        template_path
++      end
++    end
++    alias_method_chain :pick_template, :generic_paths
++    alias_method :template_exists?, :pick_template
+ 
+-  # We don't want to use generic_view_paths in ActionMailer, and we don't want
+-  # to use them unless the controller action was explicitly defined.
+-  def search_generic_view_paths?
+-    controller.respond_to?(:generic_view_paths) and controller.class.action_methods.include?(controller.action_name)
++    # Returns the view path that contains the relative template 
++    def find_generic_base_path_for(template_file_name, extension)
++      # ACC TODO use more robust method of setting this path
++      path = RAILS_ROOT + '/vendor/plugins/active_scaffold/frontends/default/views'
++      # Should be able to use a rails method here to do this directory search
++      file = Dir.entries(path).find {|f| f =~ /^_?#{template_file_name}\.?#{extension}/ }
++      file ? File.join(path, file) : nil
++    end
++
++    def find_template_extension_from_handler_with_generics(template_path, template_format = @template.template_format)
++      t_ext = find_template_extension_from_handler_without_generics(template_path, template_format)
++      if t_ext && !t_ext.empty?
++        t_ext
++      else
++        'rhtml'
++      end
++    end
++    alias_method_chain :find_template_extension_from_handler, :generics
+   end
+ end
+-
+-end
+\ No newline at end of file
++end
+diff --git a/lib/helpers/form_column_helpers.rb b/lib/helpers/form_column_helpers.rb
+index bde83ea..86867bd 100644
+--- a/lib/helpers/form_column_helpers.rb
++++ b/lib/helpers/form_column_helpers.rb
+@@ -182,9 +182,18 @@ module ActiveScaffold
+       ## Form column override signatures
+       ##
+ 
++      # FIXME hack, this has been removed in edge rails
++      def active_scaffold_partial_pieces(partial_path) 
++        if partial_path.include?('/') 
++          return File.dirname(partial_path), File.basename(partial_path) 
++        else 
++          return controller.class.controller_path, partial_path 
++        end 
++      end
++            
+       def override_form_field_partial?(column)
+-        path, partial_name = partial_pieces(override_form_field_partial(column))
+-        file_exists? File.join(path, "_#{partial_name}")
++        path, partial_name = active_scaffold_partial_pieces(override_form_field_partial(column))
++        File.exists? File.join(path, "_#{partial_name}")
+       end
+ 
+       # the naming convention for overriding form fields with partials
+-- 
+1.5.5
+
+
